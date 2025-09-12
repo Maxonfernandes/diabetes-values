@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Bluetooth Mesh Chat</title>
+    <!-- Tailwind CSS CDN for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+            color: #374151;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 p-4 min-h-screen flex items-center justify-center">
+
+    <div id="main-container" class="bg-white p-8 rounded-2xl shadow-xl w-full max-w-4xl border border-gray-200">
+        <h1 class="text-4xl font-extrabold text-center text-indigo-700 mb-6 tracking-tight">P2P Mesh Chat Simulation</h1>
+        <p class="text-center text-gray-500 mb-8">
+            This app uses the Web Bluetooth API to simulate a decentralized, serverless chat network.
+            Each device acts as a node, and messages are sent directly from one node to another.
+        </p>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <!-- Left Panel: Device Info & Discovery -->
+            <div class="bg-gray-50 p-6 rounded-xl border border-gray-100 shadow-inner">
+                <h2 class="text-2xl font-bold mb-4 text-gray-800">Your Node</h2>
+                <div id="device-info" class="mb-6 space-y-2">
+                    <p class="text-sm font-medium text-gray-600">Status: <span id="status" class="font-bold text-red-500">Disconnected</span></p>
+                    <p class="text-sm font-medium text-gray-600">Device ID: <span id="local-device-id" class="font-mono text-gray-700">Generating...</span></p>
+                </div>
+
+                <div class="space-y-4">
+                    <button id="scan-button" class="w-full bg-indigo-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-indigo-700 transition duration-300 transform hover:scale-105">
+                        Start Scanning for Nodes
+                    </button>
+
+                    <h3 class="text-xl font-bold text-gray-800 mt-6">Discovered Nodes</h3>
+                    <ul id="discovered-devices-list" class="list-none space-y-2">
+                        <!-- Devices will be listed here -->
+                        <li class="text-sm text-gray-500">No nodes found yet.</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Right Panel: Chat Interface -->
+            <div class="bg-gray-50 p-6 rounded-xl border border-gray-100 shadow-inner flex flex-col h-full">
+                <h2 class="text-2xl font-bold mb-4 text-gray-800">Chat</h2>
+                <div id="messages-container" class="flex-grow bg-white p-4 rounded-lg border border-gray-200 overflow-y-auto mb-4 h-64 md:h-96">
+                    <ul id="messages-list" class="space-y-4">
+                        <!-- Messages will be displayed here -->
+                    </ul>
+                </div>
+
+                <div class="flex items-center space-x-2">
+                    <input type="text" id="message-input" placeholder="Type a message..." class="flex-grow p-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
+                    <button id="send-button" class="bg-indigo-500 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-indigo-600 transition duration-300 transform hover:scale-105">
+                        Send
+                    </button>
+                </div>
+                <div id="error-message-box" class="mt-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded-lg hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Use an IIFE to encapsulate the application logic
+        (function() {
+            // --- UI Elements ---
+            const scanButton = document.getElementById('scan-button');
+            const discoveredDevicesList = document.getElementById('discovered-devices-list');
+            const localDeviceIdSpan = document.getElementById('local-device-id');
+            const statusSpan = document.getElementById('status');
+            const messageInput = document.getElementById('message-input');
+            const sendButton = document.getElementById('send-button');
+            const messagesList = document.getElementById('messages-list');
+            const errorMessageBox = document.getElementById('error-message-box');
+
+            // --- Globals for Bluetooth and state management ---
+            let localDeviceId = '';
+            const SERVICE_UUID = '0000180a-0000-1000-8000-00805f9b34fb'; // Using a standard UUID
+            const CHARACTERISTIC_UUID = '00002a25-0000-1000-8000-00805f9b34fb'; // Using a standard UUID
+            const connectedDevices = new Map(); // Store connected GATT servers
+            const messageHistory = new Set(); // Store sent and received messages to prevent duplicates
+            
+            // --- Utility Functions ---
+            const showMessage = (text, type = 'info') => {
+                const messageItem = document.createElement('li');
+                messageItem.className = 'p-3 rounded-lg shadow-sm text-sm';
+                if (type === 'sent') {
+                    messageItem.className += ' bg-indigo-100 text-indigo-800 self-end text-right';
+                } else if (type === 'received') {
+                    messageItem.className += ' bg-gray-100 text-gray-800';
+                } else if (type === 'system') {
+                    messageItem.className += ' text-gray-500 italic text-center';
+                }
+                messageItem.textContent = text;
+                messagesList.appendChild(messageItem);
+                messagesList.scrollTop = messagesList.scrollHeight;
+            };
+
+            const showError = (message) => {
+                errorMessageBox.textContent = message;
+                errorMessageBox.classList.remove('hidden');
+                console.error(message);
+            };
+
+            const hideError = () => {
+                errorMessageBox.classList.add('hidden');
+            };
+
+            const createUUID = () => {
+                return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+                    return v.toString(16);
+                });
+            };
+
+            // --- Bluetooth Core Logic ---
+
+            // Step 1: Request Bluetooth device
+            const scanForDevices = async () => {
+                hideError();
+                try {
+                    showMessage('Scanning for nodes...', 'system');
+                    const device = await navigator.bluetooth.requestDevice({
+                        filters: [{ services: [SERVICE_UUID] }]
+                    });
+
+                    // Add the discovered device to the UI
+                    addDeviceToUI(device);
+                    
+                } catch (error) {
+                    if (error.message.includes('disallowed by permissions policy')) {
+                        showError('Permission Denied: Your browser or environment is blocking access to Bluetooth. Please ensure you are using a compatible browser (like Chrome over HTTPS) and have explicitly granted permission for this site.');
+                    } else {
+                        showError(`Bluetooth scan failed: ${error.message}`);
+                    }
+                }
+            };
+
+            const addDeviceToUI = (device) => {
+                const deviceItem = document.createElement('li');
+                deviceItem.className = 'flex items-center justify-between p-3 bg-white rounded-lg shadow-sm border border-gray-200';
+                deviceItem.innerHTML = `
+                    <span class="text-sm font-medium text-gray-700">${device.name || 'Unknown Device'}</span>
+                    <button class="connect-button bg-green-500 text-white py-1 px-3 rounded-md text-xs hover:bg-green-600 transition duration-300" data-device-id="${device.id}">Connect</button>
+                `;
+                discoveredDevicesList.appendChild(deviceItem);
+
+                // Add event listener to the connect button
+                deviceItem.querySelector('.connect-button').addEventListener('click', () => connectToDevice(device));
+            };
+
+            // Step 2: Connect to the GATT server
+            const connectToDevice = async (device) => {
+                try {
+                    showMessage(`Connecting to ${device.name}...`, 'system');
+                    const gattServer = await device.gatt.connect();
+                    showMessage(`Connected to ${device.name}.`, 'system');
+                    
+                    // Add the device to our connected map
+                    connectedDevices.set(device.id, gattServer);
+                    updateStatus();
+
+                    // Step 3: Get the service and characteristic
+                    const service = await gattServer.getPrimaryService(SERVICE_UUID);
+                    const characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+                    // Step 4: Listen for changes (incoming messages)
+                    characteristic.addEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
+                    await characteristic.startNotifications();
+                    showMessage(`Subscribed to notifications from ${device.name}.`, 'system');
+
+                } catch (error) {
+                    showError(`Connection to ${device.name} failed: ${error.message}`);
+                }
+            };
+
+            // Step 5: Handle incoming messages (notification event)
+            const handleCharacteristicValueChanged = (event) => {
+                const value = event.target.value;
+                const message = new TextDecoder().decode(value);
+                
+                try {
+                    const messageObject = JSON.parse(message);
+                    if (messageHistory.has(messageObject.messageId)) {
+                        console.log('Duplicate message received, ignoring.');
+                        return; // Ignore duplicate messages
+                    }
+                    messageHistory.add(messageObject.messageId);
+
+                    const senderId = messageObject.senderId.substring(0, 8);
+                    showMessage(`From ${senderId}: ${messageObject.text}`, 'received');
+
+                } catch (e) {
+                    console.error("Failed to parse incoming message:", e);
+                    showMessage(`Received garbled message: ${message}`, 'received');
+                }
+            };
+
+            // Step 6: Send outgoing messages (write to characteristic)
+            const sendMessage = async () => {
+                const messageText = messageInput.value.trim();
+                if (!messageText || connectedDevices.size === 0) {
+                    showError('Please type a message and connect to at least one device.');
+                    return;
+                }
+                hideError();
+
+                const messageId = createUUID();
+                messageHistory.add(messageId);
+
+                const messageObject = {
+                    senderId: localDeviceId,
+                    messageId: messageId,
+                    text: messageText,
+                    timestamp: Date.now()
+                };
+                const messageToSend = JSON.stringify(messageObject);
+
+                showMessage(`You: ${messageText}`, 'sent');
+                messageInput.value = '';
+
+                // Broadcast message to all connected devices
+                for (const [deviceId, gattServer] of connectedDevices.entries()) {
+                    try {
+                        const service = await gattServer.getPrimaryService(SERVICE_UUID);
+                        const characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+                        const encodedMessage = new TextEncoder().encode(messageToSend);
+                        await characteristic.writeValue(encodedMessage);
+                    } catch (error) {
+                        showError(`Failed to send message to ${deviceId}: ${error.message}`);
+                    }
+                }
+            };
+
+            // --- UI Update & Event Listeners ---
+            const updateStatus = () => {
+                const count = connectedDevices.size;
+                statusSpan.textContent = count > 0 ? `Connected to ${count} node(s)` : 'Disconnected';
+                statusSpan.className = `font-bold ${count > 0 ? 'text-green-500' : 'text-red-500'}`;
+            };
+
+            scanButton.addEventListener('click', scanForDevices);
+            sendButton.addEventListener('click', sendMessage);
+            messageInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    sendMessage();
+                }
+            });
+
+            // Initial setup
+            localDeviceId = createUUID();
+            localDeviceIdSpan.textContent = localDeviceId.substring(0, 8);
+            updateStatus();
+        })();
+    </script>
+</body>
+</html>
