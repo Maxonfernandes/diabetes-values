@@ -19,6 +19,7 @@ BROADCAST_PORT = 9999
 peers = set()  # Direct connections (asyncio.StreamWriter objects)
 available_peers = set()
 peer_lock = threading.Lock()
+seen_message_ids = deque(maxlen=200) # Prevents processing duplicate packets
 
 def get_local_ip():
     """Gets the machine's local IP address."""
@@ -50,25 +51,25 @@ class RoutingManager:
         self.topology = nx.Graph()
         self.topology.add_node(local_ip)
         self.link_state_seq = 0
-        self.last_lsa = {} # Stores the latest sequence number for each node's LSA
+        self.last_lsa_seq = {} # Stores the latest sequence number for each node's LSA
 
     def get_link_state_packet(self):
-        """Creates a Link-State Advertisement (LSA) packet."""
+        """Creates a Link-State Advertisement (LSA) packet with a unique ID."""
         self.link_state_seq += 1
         neighbors = {
             writer.get_extra_info('peername')[0]: 1 # Cost of 1 for each direct link (hop count)
             for writer in self.peers if writer.get_extra_info('peername')
         }
         return {
-            "type": "lsa", "source": self.local_ip,
-            "seq": self.link_state_seq, "neighbors": neighbors
+            "type": "lsa", "id": str(uuid.uuid4()),
+            "source": self.local_ip, "seq": self.link_state_seq, "neighbors": neighbors
         }
 
     def update_topology(self, lsa):
-        """Updates the network map with a received LSA."""
+        """Updates the network map with a received LSA if it's new."""
         source, seq = lsa["source"], lsa["seq"]
-        if seq > self.last_lsa.get(source, -1):
-            self.last_lsa[source] = seq
+        if seq > self.last_lsa_seq.get(source, -1):
+            self.last_lsa_seq[source] = seq
             edges_to_remove = list(self.topology.edges(source))
             self.topology.remove_edges_from(edges_to_remove)
             for neighbor, weight in lsa["neighbors"].items():
@@ -87,12 +88,13 @@ class RoutingManager:
     async def broadcast_lsa(self):
         """Periodically sends our link-state to all direct peers."""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(10) # Broadcast link state every 10 seconds
             lsa_packet = self.get_link_state_packet()
             lsa_json = json.dumps(lsa_packet) + "\n"
+            # Add to our own seen list to prevent receiving our own broadcast
+            seen_message_ids.append(lsa_packet["id"])
             for writer in list(self.peers):
-                try:
-                    writer.write(lsa_json.encode()); await writer.drain()
+                try: writer.write(lsa_json.encode()); await writer.drain()
                 except (ConnectionResetError, BrokenPipeError): self.peers.discard(writer)
 
 # --- Connection Management ---
@@ -100,7 +102,7 @@ async def manage_connection(reader, writer, routing_manager):
     """Manages a connection: dispatches LSA and Chat packets."""
     peers.add(writer)
     peer_ip = writer.get_extra_info('peername')[0]
-
+    
     try:
         while True:
             line = await reader.readline()
@@ -108,14 +110,20 @@ async def manage_connection(reader, writer, routing_manager):
             
             try:
                 message_data = json.loads(line.decode())
-                msg_type = message_data.get("type")
+                msg_id = message_data.get("id")
 
+                # CRITICAL FIX: The main loop prevention check
+                if msg_id and msg_id in seen_message_ids:
+                    continue # Already processed this message, discard.
+
+                if msg_id: seen_message_ids.append(msg_id)
+
+                msg_type = message_data.get("type")
                 if msg_type == "lsa":
                     if routing_manager.update_topology(message_data):
                         # Forward the new LSA to other peers to sync the map
                         for p_writer in list(peers):
-                            if p_writer != writer:
-                                p_writer.write(line); await p_writer.drain()
+                            if p_writer != writer: p_writer.write(line); await p_writer.drain()
                 
                 elif msg_type == "chat":
                     dest = message_data.get("destination_ip")
@@ -125,30 +133,34 @@ async def manage_connection(reader, writer, routing_manager):
                             hops=message_data["hops"], is_private=(dest != "all")))
                     
                     if dest != routing_manager.local_ip:
-                        # Forward the message using the calculated best path
-                        next_hop = routing_manager.get_next_hop(dest) if dest != "all" else None
+                        # This message needs to be forwarded
                         message_data["hops"] += 1
                         forward_msg = json.dumps(message_data) + "\n"
 
-                        if dest == "all": # Broadcast
+                        if dest == "all": # Broadcast (flood to neighbors)
                             for p_writer in list(peers):
                                 if p_writer != writer: p_writer.write(forward_msg.encode()); await p_writer.drain()
-                        elif next_hop: # Unicast
-                            for p_writer in list(peers):
-                                if p_writer.get_extra_info('peername')[0] == next_hop:
-                                    p_writer.write(forward_msg.encode()); await p_writer.drain()
-                                    break
+                        else: # Unicast (use Dijkstra's path)
+                            next_hop = routing_manager.get_next_hop(dest)
+                            if next_hop:
+                                for p_writer in list(peers):
+                                    peer_info = p_writer.get_extra_info('peername')
+                                    if peer_info and peer_info[0] == next_hop:
+                                        p_writer.write(forward_msg.encode()); await p_writer.drain()
+                                        break
             except (json.JSONDecodeError, KeyError): pass
 
     except (ConnectionResetError, asyncio.IncompleteReadError): pass
     finally:
         await aioconsole.aprint(format_message("System", f"🏃 Peer {peer_ip} disconnected."))
         if writer in peers: peers.remove(writer)
-        routing_manager.topology.remove_node(peer_ip) # Remove node from map
+        if routing_manager.topology.has_node(peer_ip):
+            routing_manager.topology.remove_node(peer_ip)
         if not writer.is_closing(): writer.close(); await writer.wait_closed()
 
 # --- Core Networking (simplified by passing manager) ---
 async def connect_to_peer(ip, routing_manager):
+    """Establishes a new outgoing connection to a peer."""
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, PORT), timeout=5)
         asyncio.create_task(manage_connection(reader, writer, routing_manager))
@@ -156,11 +168,11 @@ async def connect_to_peer(ip, routing_manager):
         await aioconsole.aprint(format_message("System", f"❌ Failed to connect to {ip}: {e}", color=Fore.RED))
 
 async def handle_peer(reader, writer, routing_manager):
+    """Handles incoming connections from other peers."""
     asyncio.create_task(manage_connection(reader, writer, routing_manager))
 
 # --- UDP Discovery (Unchanged) ---
 def udp_broadcast_task():
-    # ... (code is unchanged)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         while True:
@@ -169,36 +181,29 @@ def udp_broadcast_task():
             time.sleep(5)
 
 def udp_listen_task():
-    # ... (code is unchanged)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); sock.bind(('', BROADCAST_PORT))
         while True:
             ip = sock.recvfrom(1024)[0].decode()
-            if ip != LOCAL_IP:
-                with peer_lock: available_peers.add(ip)
+            if ip != LOCAL_IP: 
+                with peer_lock: 
+                    available_peers.add(ip)
 
 # --- Main UI Loop (Updated for New Commands) ---
 async def chat_interface(routing_manager):
-    await aioconsole.aprint(format_message("System", "Welcome! Dijkstra routing is active. Type '/h' for help."))
+    await aioconsole.aprint(format_message("System", "Dijkstra routing is active. Type '/h' for help."))
     while True:
         user_input = await aioconsole.ainput("> ")
         if not user_input: continue
-
         if user_input.startswith('/'):
-            parts = user_input.split()
-            command = parts[0].lower()
-            
-            if command == '/s': # Scan
-                # ... (unchanged)
+            parts = user_input.split(); command = parts[0].lower()
+            if command == '/s':
                 with peer_lock: peer_list = sorted(list(available_peers))
                 if not peer_list: await aioconsole.aprint(format_message("System", "No other peers found yet."))
                 else:
-                    await aioconsole.aprint(Fore.YELLOW + "--- Available Peers ---")
-                    for i, ip in enumerate(peer_list): await aioconsole.aprint(f"  [{i}] {ip}")
-                    await aioconsole.aprint(format_message("System", "Use '/connect <number>' to connect."))
-
-            elif command == '/connect': # Connect
-                # ... (unchanged)
+                    await aioconsole.aprint(Fore.YELLOW + "--- Available Peers ---"); [await aioconsole.aprint(f"  [{i}] {ip}") for i, ip in enumerate(peer_list)]
+                    await aioconsole.aprint(format_message("System", "Use '/connect <number>' to establish a direct link."))
+            elif command == '/connect':
                 if len(parts) < 2: await aioconsole.aprint(format_message("System", "Usage: /connect <number>", color=Fore.RED)); continue
                 try:
                     choice = int(parts[1])
@@ -206,47 +211,35 @@ async def chat_interface(routing_manager):
                     if 0 <= choice < len(peer_list): asyncio.create_task(connect_to_peer(peer_list[choice], routing_manager))
                     else: await aioconsole.aprint(format_message("System", "That number is not in the list.", color=Fore.RED))
                 except (ValueError, IndexError): await aioconsole.aprint(format_message("System", "Invalid selection.", color=Fore.RED))
-
-            elif command == '/map': # New command to view topology
-                await aioconsole.aprint(Fore.YELLOW + "--- Network Map ---")
+            elif command == '/map':
+                await aioconsole.aprint(Fore.YELLOW + "--- Network Map (Your View) ---")
                 for node, neighbors in routing_manager.topology.adjacency():
                     neighbor_list = ", ".join(neighbors)
                     await aioconsole.aprint(f"  {node} -> [{neighbor_list}]")
-            
-            elif command == '/msg': # New Private Message command
-                if len(parts) < 3:
-                    await aioconsole.aprint(format_message("System", "Usage: /msg <destination_ip> <message>", color=Fore.RED))
-                    continue
+            elif command == '/msg':
+                if len(parts) < 3: await aioconsole.aprint(format_message("System", "Usage: /msg <destination_ip> <message>", color=Fore.RED)); continue
                 dest_ip, payload = parts[1], " ".join(parts[2:])
                 next_hop = routing_manager.get_next_hop(dest_ip)
-                if not next_hop:
-                    await aioconsole.aprint(format_message("System", f"No path to {dest_ip} found.", color=Fore.RED))
-                    continue
+                if not next_hop: await aioconsole.aprint(format_message("System", f"No path to {dest_ip} found in the map.", color=Fore.RED)); continue
                 
-                message_data = {
-                    "type": "chat", "id": str(uuid.uuid4()), "origin_ip": LOCAL_IP,
-                    "destination_ip": dest_ip, "hops": 0, "payload": payload
-                }
+                msg_id = str(uuid.uuid4())
+                message_data = {"type": "chat", "id": msg_id, "origin_ip": LOCAL_IP, "destination_ip": dest_ip, "hops": 0, "payload": payload}
+                seen_message_ids.append(msg_id)
                 await aioconsole.aprint(format_message(LOCAL_IP, payload, is_self=True, is_private=True))
                 
-                # Send ONLY to the next hop
                 for writer in list(peers):
-                    if writer.get_extra_info('peername')[0] == next_hop:
-                        writer.write((json.dumps(message_data) + "\n").encode())
-                        await writer.drain(); break
-
-            elif command == '/q': break # Quit
-            else: await aioconsole.aprint(format_message("System", "Unknown command. Use /h for help."))
-
+                    peer_info = writer.get_extra_info('peername')
+                    if peer_info and peer_info[0] == next_hop:
+                        writer.write((json.dumps(message_data) + "\n").encode()); await writer.drain(); break
+            elif command == '/h': await aioconsole.aprint(format_message("System", "Commands: /s, /connect <num>, /map, /msg <ip> <text>, /q"))
+            elif command == '/q': break
+            else: await aioconsole.aprint(format_message("System", "Unknown command."))
         else: # Broadcast (group chat) message
-            message_data = {
-                "type": "chat", "id": str(uuid.uuid4()), "origin_ip": LOCAL_IP,
-                "destination_ip": "all", "hops": 0, "payload": user_input
-            }
+            msg_id = str(uuid.uuid4())
+            message_data = {"type": "chat", "id": msg_id, "origin_ip": LOCAL_IP, "destination_ip": "all", "hops": 0, "payload": user_input}
+            seen_message_ids.append(msg_id)
             await aioconsole.aprint(format_message(LOCAL_IP, user_input, is_self=True))
-            for writer in list(peers):
-                writer.write((json.dumps(message_data) + "\n").encode())
-                await writer.drain()
+            for writer in list(peers): writer.write((json.dumps(message_data) + "\n").encode()); await writer.drain()
 
 async def main():
     print("--- P2P Dijkstra Mesh Chat ---"); print(f"[Info] Your IP: {LOCAL_IP}")
