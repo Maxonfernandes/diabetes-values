@@ -14,7 +14,7 @@ BROADCAST_PORT = 9999
 # --- Global State ---
 peers = set()  # A set of connected asyncio.StreamWriter objects
 available_peers = set()  # A set of discovered IP addresses
-peer_lock = threading.Lock() # A lock for safely modifying available_peers
+peer_lock = threading.Lock()  # A lock for safely modifying available_peers
 
 def get_local_ip():
     """Gets the machine's local IP address."""
@@ -27,62 +27,59 @@ def get_local_ip():
 
 LOCAL_IP = get_local_ip()
 
-# --- Message Formatting ---
+# --- Message & UI Formatting ---
 def format_message(sender_ip, message, is_self=False, color=None):
     """Formats messages with appropriate colors."""
-    if color is None:
-        color = Fore.CYAN  # Default color for peers
-    
+    if color is None: color = Fore.CYAN
     if is_self:
-        sender = "Me"
-        color = Fore.GREEN
+        sender, color = "Me", Fore.GREEN
     elif sender_ip == "System":
-        sender = "System"
-        color = Fore.YELLOW
+        sender, color = "System", Fore.YELLOW
     else:
         sender = sender_ip
-    
     return f"{color}{sender}: {Style.RESET_ALL}{message}"
 
-# --- Networking Core: Connection & Server ---
-async def connect_to_peer(ip: str):
-    """Establishes a TCP connection to a peer."""
-    connected_ips = [w.get_extra_info('peername')[0] for w in peers if w.get_extra_info('peername')]
-    if ip == LOCAL_IP or ip in connected_ips:
-        return
-
-    try:
-        await aioconsole.aprint(format_message("System", f"Attempting to connect to {ip}..."))
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, PORT), timeout=5)
-        peers.add(writer)
-        peer_ip = writer.get_extra_info('peername')[0]
-        await aioconsole.aprint(format_message("System", f"✅ Successfully connected to {peer_ip}"))
-    except Exception as e:
-        await aioconsole.aprint(format_message("System", f"❌ Failed to connect to {ip}: {e}", color=Fore.RED))
-
-async def handle_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Handles incoming connections and messages from a peer."""
+# --- Refactored Connection Lifecycle Management ---
+async def manage_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Manages the entire lifecycle of a single peer connection."""
     peers.add(writer)
     peer_ip = writer.get_extra_info('peername')[0]
-    await aioconsole.aprint(format_message("System", f"🔗 New peer connected: {peer_ip}"))
-    
+    await aioconsole.aprint(format_message("System", f"🔗 Connection established with {peer_ip}"))
+
     try:
         while True:
             data = await reader.readline()
-            if not data:
-                break
+            if not data: break
             message = data.decode().strip()
             await aioconsole.aprint(format_message(peer_ip, message))
-    except (ConnectionResetError, asyncio.IncompleteReadError):
-        pass
+    except (ConnectionResetError, asyncio.IncompleteReadError): pass
     except Exception as e:
         await aioconsole.aprint(format_message("System", f"An error occurred with peer {peer_ip}: {e}", color=Fore.RED))
     finally:
         await aioconsole.aprint(format_message("System", f"🏃 Peer {peer_ip} disconnected."))
-        if writer in peers:
-            peers.remove(writer)
-        writer.close()
-        await writer.wait_closed()
+        if writer in peers: peers.remove(writer)
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+
+# --- Core Networking Functions ---
+async def connect_to_peer(ip: str):
+    """Establishes a new outgoing connection to a peer."""
+    connected_ips = [w.get_extra_info('peername')[0] for w in peers if w.get_extra_info('peername')]
+    if ip == LOCAL_IP or ip in connected_ips: return
+
+    try:
+        await aioconsole.aprint(format_message("System", f"Attempting to connect to {ip}..."))
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, PORT), timeout=5)
+        # CRITICAL FIX: Start a task to manage this connection for two-way chat
+        asyncio.create_task(manage_connection(reader, writer))
+    except Exception as e:
+        await aioconsole.aprint(format_message("System", f"❌ Failed to connect to {ip}: {e}", color=Fore.RED))
+
+async def handle_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Handles incoming connections from other peers."""
+    # CRITICAL FIX: Hand off the connection to the unified manager
+    asyncio.create_task(manage_connection(reader, writer))
 
 # --- UDP Discovery Threads ---
 def udp_broadcast_task():
@@ -92,8 +89,7 @@ def udp_broadcast_task():
         while True:
             try:
                 sock.sendto(LOCAL_IP.encode(), ("255.255.255.255", BROADCAST_PORT))
-            except Exception:
-                pass
+            except Exception: pass
             time.sleep(5)
 
 def udp_listen_task():
@@ -104,8 +100,21 @@ def udp_listen_task():
         while True:
             ip = sock.recvfrom(1024)[0].decode()
             if ip != LOCAL_IP:
-                with peer_lock:
-                    available_peers.add(ip)
+                with peer_lock: available_peers.add(ip)
+
+# --- UI Helper Function ---
+async def _display_connected_peers():
+    """Helper function to show a numbered list of connected peers."""
+    if not peers:
+        await aioconsole.aprint(format_message("System", "You are not connected to any peers."))
+        return None
+    
+    await aioconsole.aprint(Fore.YELLOW + "--- Currently Connected Peers ---")
+    peer_writers = list(peers)
+    for i, writer in enumerate(peer_writers):
+        peer_info = writer.get_extra_info('peername')
+        if peer_info: await aioconsole.aprint(f"  [{i}] {peer_info[0]}")
+    return peer_writers
 
 # --- Main User Interface Loop ---
 async def chat_interface():
@@ -113,9 +122,7 @@ async def chat_interface():
     await aioconsole.aprint(format_message("System", "Welcome! Type '/h' for a list of commands."))
     while True:
         user_input = await aioconsole.ainput("> ")
-
-        if not user_input:
-            continue
+        if not user_input: continue
 
         if user_input.startswith('/'):
             parts = user_input.lower().split()
@@ -129,7 +136,6 @@ async def chat_interface():
                     await aioconsole.aprint(Fore.YELLOW + "--- Available Peers (on Network) ---")
                     for i, ip in enumerate(peer_list): await aioconsole.aprint(f"  [{i}] {ip}")
                     await aioconsole.aprint(format_message("System", "Use '/connect <number>' to connect."))
-
             elif command == '/connect':
                 if len(parts) < 2:
                     await aioconsole.aprint(format_message("System", "Usage: /connect <number>", color=Fore.RED))
@@ -137,79 +143,45 @@ async def chat_interface():
                 try:
                     choice = int(parts[1])
                     with peer_lock: peer_list = sorted(list(available_peers))
-                    if 0 <= choice < len(peer_list):
-                        ip_to_connect = peer_list[choice]
-                        asyncio.create_task(connect_to_peer(ip_to_connect))
-                    else:
-                        await aioconsole.aprint(format_message("System", "That number is not in the list.", color=Fore.RED))
-                except (ValueError, IndexError):
-                    await aioconsole.aprint(format_message("System", "Invalid selection.", color=Fore.RED))
-
+                    if 0 <= choice < len(peer_list): asyncio.create_task(connect_to_peer(peer_list[choice]))
+                    else: await aioconsole.aprint(format_message("System", "That number is not in the list.", color=Fore.RED))
+                except (ValueError, IndexError): await aioconsole.aprint(format_message("System", "Invalid selection.", color=Fore.RED))
             elif command == '/peers':
-                if not peers:
-                    await aioconsole.aprint(format_message("System", "You are not connected to any peers."))
-                else:
-                    await aioconsole.aprint(Fore.YELLOW + "--- Currently Connected Peers ---")
-                    peer_writers = list(peers)
-                    for i, writer in enumerate(peer_writers):
-                        peer_info = writer.get_extra_info('peername')
-                        if peer_info: await aioconsole.aprint(f"  [{i}] {peer_info[0]}")
-
+                await _display_connected_peers()
             elif command == '/disconnect':
-                if not peers:
-                    await aioconsole.aprint(format_message("System", "You are not connected to any peers."))
-                    continue
-                
-                peer_writers = list(peers)
-                await aioconsole.aprint(Fore.YELLOW + "--- Select a Peer to Disconnect ---")
-                for i, writer in enumerate(peer_writers):
-                    peer_info = writer.get_extra_info('peername')
-                    if peer_info: await aioconsole.aprint(f"  [{i}] {peer_info[0]}")
-
+                peer_writers = await _display_connected_peers()
+                if not peer_writers: continue
                 try:
                     choice_str = await aioconsole.ainput("Enter number to disconnect (or 'c' to cancel): ")
                     if choice_str.lower() == 'c': continue
-                    
                     choice = int(choice_str)
                     if 0 <= choice < len(peer_writers):
                         writer_to_close = peer_writers[choice]
                         writer_to_close.close()
                         await writer_to_close.wait_closed()
-                    else:
-                        await aioconsole.aprint(format_message("System", "That number is not in the list.", color=Fore.RED))
-                except (ValueError, IndexError):
-                    await aioconsole.aprint(format_message("System", "Invalid selection.", color=Fore.RED))
-
+                    else: await aioconsole.aprint(format_message("System", "That number is not in the list.", color=Fore.RED))
+                except (ValueError, IndexError): await aioconsole.aprint(format_message("System", "Invalid selection.", color=Fore.RED))
             elif command == '/h':
                 await aioconsole.aprint(format_message("System", "Commands: /s (scan), /connect <num>, /peers, /disconnect, /q (quit), /h (help)"))
-            
-            elif command == '/q':
-                break
-            else:
-                await aioconsole.aprint(format_message("System", f"Unknown command: {command}", color=Fore.RED))
-        
-        else: # It's a chat message
+            elif command == '/q': break
+            else: await aioconsole.aprint(format_message("System", f"Unknown command: {command}", color=Fore.RED))
+        else:
             if not peers:
                 await aioconsole.aprint(format_message("System", "You are not connected to anyone. Use /s and /connect to start a chat."))
                 continue
-
             await aioconsole.aprint(format_message(LOCAL_IP, user_input, is_self=True))
             for writer in list(peers):
                 if not writer.is_closing():
                     try:
                         writer.write(f"{user_input}\n".encode())
                         await writer.drain()
-                    except (ConnectionResetError, BrokenPipeError):
-                        peers.discard(writer)
+                    except (ConnectionResetError, BrokenPipeError): peers.discard(writer)
     
-    # Graceful shutdown
-    for writer in peers:
-        writer.close()
-        await writer.wait_closed()
-    for task in asyncio.all_tasks():
-        if task is not asyncio.current_task():
-            task.cancel()
-
+    # Graceful shutdown initiated by '/q'
+    await aioconsole.aprint(format_message("System", "Shutting down..."))
+    for writer in list(peers):
+        if not writer.is_closing(): writer.close()
+    
 async def main():
     """Initializes and runs all concurrent tasks."""
     print("--- P2P Chat ---")
@@ -229,4 +201,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, asyncio.CancelledError):
+        # Graceful shutdown for Ctrl+C
+        pass
+    finally:
         print("\nExiting...")
