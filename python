@@ -1,0 +1,168 @@
+import asyncio
+import socket
+import time
+import threading # <-- NEW: Import for locking
+
+PORT = 8888
+BROADCAST_PORT = 9999
+peers = set()  # Set of currently connected peer writers
+
+# --- NEW: Shared state for discovered peers ---
+available_peers = set()
+peer_lock = threading.Lock() # To safely modify the set from a different thread
+
+def get_local_ip():
+    """Gets the local IP address of the machine."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+LOCAL_IP = get_local_ip()
+
+# --- Peer Management ---
+async def connect_to_peer(ip: str):
+    """Establishes a TCP connection to a chosen peer."""
+    # Check if we are already connected to this peer
+    connected_ips = [w.get_extra_info('peername')[0] for w in peers if w.get_extra_info('peername')]
+    if ip == LOCAL_IP or ip in connected_ips:
+        print(f"[Info] Already connected to or attempting to connect to self ({ip}). Skipping.")
+        return
+
+    try:
+        print(f"[Action] Attempting to connect to {ip}...")
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, PORT), timeout=5)
+        peers.add(writer)
+        peer_ip = writer.get_extra_info('peername')[0]
+        print(f"✅ [Success] Connected to {peer_ip}")
+    except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
+        print(f"❌ [Failure] Could not connect to {ip}: {e}")
+
+# --- TCP Server Logic (Unchanged) ---
+async def handle_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    peers.add(writer)
+    peer_ip = writer.get_extra_info('peername')[0]
+    print(f"🔗 [Info] New peer connected: {peer_ip}")
+    try:
+        while True:
+            data = await reader.readline()
+            if not data: break
+            message = data.decode().strip()
+            print(f"💬 [{peer_ip}]: {message}")
+            for p in peers:
+                if p != writer and not p.is_closing():
+                    try:
+                        p.write(f"[{peer_ip}]: {message}\n".encode())
+                        await p.drain()
+                    except (ConnectionResetError, BrokenPipeError):
+                        peers.discard(p)
+    except (ConnectionResetError, asyncio.IncompleteReadError):
+        print(f"🏃 [Info] Peer {peer_ip} disconnected.")
+    finally:
+        if writer in peers: peers.remove(writer)
+        writer.close()
+        await writer.wait_closed()
+
+# --- User Input (Unchanged) ---
+async def handle_user_input():
+    print("\nType your message and press Enter to send.")
+    print("-----------------------------------------")
+    while True:
+        message = await asyncio.to_thread(input, "")
+        if not message: continue
+        for writer in list(peers):
+            if not writer.is_closing():
+                try:
+                    writer.write(f"[{LOCAL_IP}]: {message}\n".encode())
+                    await writer.drain()
+                except (ConnectionResetError, BrokenPipeError):
+                    print(f"🏃 [Info] Peer {writer.get_extra_info('peername')[0]} disconnected while sending.")
+                    peers.discard(writer)
+
+# --- UDP Peer Discovery ---
+def udp_broadcast_task():
+    """Blocking task that broadcasts our IP via UDP periodically."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while True:
+            try:
+                sock.sendto(LOCAL_IP.encode(), ("255.255.255.255", BROADCAST_PORT))
+            except Exception as e:
+                print(f"[Broadcast Error] {e}")
+            time.sleep(5)
+
+# --- MODIFIED: UDP Listener now populates a list instead of auto-connecting ---
+def udp_listen_task():
+    """Blocking task that listens for broadcasts and adds peers to an 'available' list."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('', BROADCAST_PORT))
+        while True:
+            data, addr = sock.recvfrom(1024)
+            ip = data.decode()
+            if ip != LOCAL_IP:
+                with peer_lock: # Use lock to safely add to the set
+                    available_peers.add(ip)
+
+# --- NEW: Interactive menu for connecting to discovered peers ---
+async def interactive_connect_loop():
+    """Periodically allows the user to view and connect to discovered peers."""
+    while True:
+        await asyncio.sleep(1) # Don't lock the main thread
+        command = await asyncio.to_thread(
+            input, "\nPress 's' to show and connect to peers, or just type a message: "
+        )
+
+        if command.lower() == 's':
+            with peer_lock:
+                peer_list = sorted(list(available_peers))
+
+            if not peer_list:
+                print("\n[Info] No other peers found yet. Waiting for discovery...")
+                continue
+
+            print("\n--- Available Peers ---")
+            for i, peer_ip in enumerate(peer_list):
+                print(f"  [{i}] {peer_ip}")
+            print("-----------------------")
+
+            try:
+                choice_str = await asyncio.to_thread(input, "Enter the number of the peer to connect to (or 'c' to cancel): ")
+                if choice_str.lower() == 'c':
+                    continue
+                choice = int(choice_str)
+                if 0 <= choice < len(peer_list):
+                    ip_to_connect = peer_list[choice]
+                    asyncio.create_task(connect_to_peer(ip_to_connect))
+                else:
+                    print("❌ Invalid number.")
+            except ValueError:
+                print("❌ Invalid input. Please enter a number.")
+            except Exception as e:
+                print(f"An error occurred: {e}")
+
+async def main():
+    """Main function to set up and run all tasks."""
+    print("--- P2P Chat with Interactive Connect ---")
+    print(f"[Info] Your Local IP: {LOCAL_IP}")
+
+    server = await asyncio.start_server(handle_peer, LOCAL_IP, PORT)
+    print(f"[Info] TCP Server listening on {LOCAL_IP}:{PORT}")
+
+    loop = asyncio.get_running_loop()
+
+    # The user input handler is now replaced by the interactive connect loop
+    await asyncio.gather(
+        server.serve_forever(),
+        loop.run_in_executor(None, udp_broadcast_task),
+        loop.run_in_executor(None, udp_listen_task),
+        interactive_connect_loop() # <-- REPLACED user input with this menu
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting...")
