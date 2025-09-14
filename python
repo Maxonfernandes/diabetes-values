@@ -12,9 +12,9 @@ PORT = 8888
 BROADCAST_PORT = 9999
 
 # --- Global State ---
-peers = set()  # A set of connected asyncio.StreamWriter objects
-available_peers = set()  # A set of discovered IP addresses
-peer_lock = threading.Lock() # A lock for safely modifying available_peers
+peers = set()
+available_peers = set()
+peer_lock = threading.Lock()
 
 def get_local_ip():
     """Gets the machine's local IP address."""
@@ -28,9 +28,11 @@ def get_local_ip():
 LOCAL_IP = get_local_ip()
 
 # --- Message Formatting ---
-def format_message(sender_ip, message, is_self=False):
+def format_message(sender_ip, message, is_self=False, color=None): # <-- FIX 2: Added 'color' parameter
     """Formats messages with appropriate colors."""
-    color = Fore.CYAN  # Default color for peers
+    if color is None:
+        color = Fore.CYAN  # Default color for peers
+    
     if is_self:
         sender = "Me"
         color = Fore.GREEN
@@ -56,6 +58,7 @@ async def connect_to_peer(ip: str):
         peer_ip = writer.get_extra_info('peername')[0]
         await aioconsole.aprint(format_message("System", f"✅ Successfully connected to {peer_ip}"))
     except Exception as e:
+        # This call now works correctly because of Fix 2
         await aioconsole.aprint(format_message("System", f"❌ Failed to connect to {ip}: {e}", color=Fore.RED))
 
 async def handle_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -72,7 +75,10 @@ async def handle_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             message = data.decode().strip()
             await aioconsole.aprint(format_message(peer_ip, message))
     except (ConnectionResetError, asyncio.IncompleteReadError):
-        pass  # The finally block will handle cleanup
+        pass  # Handles clean and abrupt disconnects
+    except Exception as e:
+        # <-- FIX 1: This block catches all other errors to prevent crashing
+        await aioconsole.aprint(format_message("System", f"An error occurred with peer {peer_ip}: {e}", color=Fore.RED))
     finally:
         await aioconsole.aprint(format_message("System", f"🏃 Peer {peer_ip} disconnected."))
         if writer in peers:
@@ -89,7 +95,7 @@ def udp_broadcast_task():
             try:
                 sock.sendto(LOCAL_IP.encode(), ("255.255.255.255", BROADCAST_PORT))
             except Exception:
-                pass # Avoid crashing on network errors
+                pass
             time.sleep(5)
 
 def udp_listen_task():
