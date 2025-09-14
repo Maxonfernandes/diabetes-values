@@ -107,13 +107,14 @@ def udp_listen_task():
                     available_peers.add(ip)
 
 # --- NEW: Interactive menu for connecting to discovered peers ---
+# --- REVISED: Interactive menu that ALSO sends messages ---
 async def interactive_connect_loop():
-    """Periodically allows the user to view and connect to discovered peers."""
+    """Periodically allows the user to view/connect OR send a message."""
     while True:
-        await asyncio.sleep(1) # Don't lock the main thread
-        command = await asyncio.to_thread(
-            input, "\nPress 's' to show and connect to peers, or just type a message: "
-        )
+        # We add a small sleep to prevent the prompt from overlapping with received messages
+        await asyncio.sleep(0.1) 
+        prompt = "\n> Press 's' to show peers, or type a message and press Enter: "
+        command = await asyncio.to_thread(input, prompt)
 
         if command.lower() == 's':
             with peer_lock:
@@ -142,6 +143,21 @@ async def interactive_connect_loop():
                 print("❌ Invalid input. Please enter a number.")
             except Exception as e:
                 print(f"An error occurred: {e}")
+        
+        # <-- FIX: Added this else block to handle sending messages
+        elif command: # Ensure the message is not empty
+            message_to_send = f"[{LOCAL_IP}]: {command}"
+            print(f"Me: {command}") # Show your own message
+            
+            # Use list(peers) to create a copy in case the set is modified
+            for writer in list(peers):
+                if not writer.is_closing():
+                    try:
+                        writer.write(f"{message_to_send}\n".encode())
+                        await writer.drain()
+                    except (ConnectionResetError, BrokenPipeError):
+                        print(f"🏃 [Info] Peer {writer.get_extra_info('peername')[0]} disconnected while sending.")
+                        peers.discard(writer)
 
 async def main():
     """Main function to set up and run all tasks."""
